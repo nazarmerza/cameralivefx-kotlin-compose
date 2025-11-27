@@ -1,10 +1,12 @@
 package com.nmerza.cameraapp
 
+import NativeFilter
 import android.Manifest
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,7 +17,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -26,11 +28,11 @@ import androidx.compose.material.icons.filled.FlipCameraAndroid
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -38,11 +40,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import kotlinx.coroutines.flow.StateFlow
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
@@ -50,10 +51,10 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     private lateinit var cameraExecutor: ExecutorService
+    lateinit var imageProcessor: ImageProcessor
     private var imageCapture: ImageCapture? = null
     private var cameraProvider: ProcessCameraProvider? = null
 
-    // 💡 NEW: State to store the URI of the last saved photo
     private var lastPhotoUri by mutableStateOf<Uri?>(null)
 
     private val requestPermissionsLauncher =
@@ -65,17 +66,14 @@ class MainActivity : ComponentActivity() {
                 setupCameraContent()
             } else {
                 Log.e("CameraApp", "Permissions not granted")
-                setContent {
-                    CameraAppThemeTheme {
-                        PermissionDeniedScreen()
-                    }
-                }
+                setContent { CameraAppThemeTheme { PermissionDeniedScreen() } }
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cameraExecutor = Executors.newSingleThreadExecutor()
+        imageProcessor = ImageProcessor(NativeFilter(), cameraExecutor)
 
         val permissionsToRequest = mutableListOf(
             Manifest.permission.CAMERA
@@ -93,16 +91,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setupCameraContent() {
-        // 💡 UPDATE: Find the last photo taken when the app starts
         lastPhotoUri = findLastPhotoUri()
 
         setContent {
             CameraAppThemeTheme {
                 CameraAppCameraScreen(
+                    imageProcessor = imageProcessor,
+                    processedBitmapFlow = imageProcessor.processedBitmap,
                     onCapturePhoto = { capturePhoto() },
                     onImageCaptureReady = { capture -> imageCapture = capture },
                     onCameraProviderReady = { provider -> cameraProvider = provider },
-                    // 💡 NEW: Pass the last photo URI getter
                     getLastPhotoUri = { lastPhotoUri }
                 )
             }
@@ -112,8 +110,7 @@ class MainActivity : ComponentActivity() {
     private fun capturePhoto() {
         val imageCapture = this.imageCapture ?: return
 
-        val name = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-            .format(System.currentTimeMillis())
+        val name = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US).format(System.currentTimeMillis())
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -136,25 +133,19 @@ class MainActivity : ComponentActivity() {
 
                 override fun onImageSaved(output: ImageCapture.OutputFileResults){
                     Log.d("CameraApp", "Photo capture succeeded: ${output.savedUri}")
-                    // 💡 UPDATE: Store the URI of the successfully saved photo
                     output.savedUri?.let { lastPhotoUri = it }
                 }
             }
         )
     }
 
-    // 💡 NEW: Function to find the absolute latest photo from MediaStore
     private fun findLastPhotoUri(): Uri? {
         val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_TAKEN)
         val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC"
         val contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
 
         return contentResolver.query(
-            contentUri,
-            projection,
-            null,
-            null,
-            sortOrder
+            contentUri, projection, null, null, sortOrder
         )?.use { cursor ->
             if (cursor.moveToFirst()) {
                 val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
@@ -205,18 +196,18 @@ enum class UiOption {
 
 @Composable
 fun CameraAppCameraScreen(
+    imageProcessor: ImageProcessor,
+    processedBitmapFlow: StateFlow<Bitmap?>,
     onCapturePhoto: () -> Unit,
     onImageCaptureReady: (ImageCapture) -> Unit,
     onCameraProviderReady: (ProcessCameraProvider) -> Unit,
-    // 💡 NEW: Last photo URI getter
     getLastPhotoUri: () -> Uri?
 ) {
     var selectedOption by remember { mutableStateOf(UiOption.OPTION_TWO) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
-    // 💡 NEW: State to control navigation (e.g., show photo gallery)
     var showLastPhoto by remember { mutableStateOf(false) }
 
-    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleOwner = LocalContext.current as LifecycleOwner
     val context = LocalContext.current
 
     Box(
@@ -224,29 +215,27 @@ fun CameraAppCameraScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Camera Preview (full screen)
-        CameraPreview(
+        ProcessedCameraPreview(
+            imageProcessor = imageProcessor,
             modifier = Modifier.fillMaxSize(),
             lensFacing = lensFacing,
             onImageCaptureReady = onImageCaptureReady,
             onCameraProviderReady = onCameraProviderReady,
-            lifecycleOwner = lifecycleOwner
+            lifecycleOwner = lifecycleOwner,
+            processedBitmapFlow = processedBitmapFlow
         )
 
-        // Top Bar
         TopAppBar(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 10.dp)
         )
 
-        // Bottom Sheet UI
         BottomSheetUI(
             modifier = Modifier.align(Alignment.BottomCenter),
             selectedOption = selectedOption,
             onOptionSelected = { option ->
                 selectedOption = option
-                // TODO: apply selected option to camera preview or frames
                 Log.d("CameraApp", "Selected option: ${option.name}")
             },
             onSwitchCamera = {
@@ -257,19 +246,14 @@ fun CameraAppCameraScreen(
                 }
             },
             onCapturePhoto = onCapturePhoto,
-            // 💡 NEW: Pass the URI getter and the navigation setter
             getLastPhotoUri = getLastPhotoUri,
-            onThumbnailClick = {
-                showLastPhoto = true
-            }
+            onThumbnailClick = { showLastPhoto = true }
         )
     }
 
-    // 💡 NEW: Logic to handle showing the last photo/navigating
     if (showLastPhoto) {
         val lastUri = getLastPhotoUri()
         if (lastUri != null) {
-            // Launch Android's default viewer for the image URI
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(lastUri, "image/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -282,20 +266,24 @@ fun CameraAppCameraScreen(
         } else {
             Log.d("CameraApp", "Thumbnail clicked. No photo saved yet.")
         }
-        showLastPhoto = false // Reset state after attempting to view
+        showLastPhoto = false
     }
 }
 
 @Composable
-fun CameraPreview(
+fun ProcessedCameraPreview(
+    imageProcessor: ImageProcessor,
     modifier: Modifier = Modifier,
     lensFacing: Int,
     onImageCaptureReady: (ImageCapture) -> Unit,
     onCameraProviderReady: (ProcessCameraProvider) -> Unit,
-    lifecycleOwner: LifecycleOwner
+    lifecycleOwner: LifecycleOwner,
+    processedBitmapFlow: StateFlow<Bitmap?>
 ) {
     val context = LocalContext.current
-    val previewView = remember { PreviewView(context) }
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    val bitmap by processedBitmapFlow.collectAsState()
 
     LaunchedEffect(lensFacing) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -303,15 +291,17 @@ fun CameraPreview(
             val cameraProvider = cameraProviderFuture.get()
             onCameraProviderReady(cameraProvider)
 
-            val preview = Preview.Builder().build().also {
-                it.surfaceProvider = previewView.surfaceProvider
-            }
-
             val imageCapture = ImageCapture.Builder()
                 .setFlashMode(ImageCapture.FLASH_MODE_OFF)
                 .build()
-
             onImageCaptureReady(imageCapture)
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, imageProcessor)
+                }
 
             val cameraSelector = CameraSelector.Builder()
                 .requireLensFacing(lensFacing)
@@ -322,7 +312,7 @@ fun CameraPreview(
                 cameraProvider.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
-                    preview,
+                    imageAnalysis, 
                     imageCapture
                 )
             } catch (e: Exception) {
@@ -331,10 +321,16 @@ fun CameraPreview(
         }, ContextCompat.getMainExecutor(context))
     }
 
-    AndroidView(
-        factory = { previewView },
-        modifier = modifier
-    )
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap!!.asImageBitmap(),
+            contentDescription = "Real-time camera preview with filter",
+            modifier = modifier,
+            contentScale = ContentScale.Crop
+        )
+    } else {
+        Box(modifier = modifier.background(Color.Black))
+    }
 }
 
 @Composable
@@ -360,7 +356,6 @@ fun TopAppBar(modifier: Modifier = Modifier) {
 fun ThumbnailPreview(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    // 💡 NEW: Parameter to receive the last photo's URI
     lastPhotoUri: Uri?
 ) {
     Box(
@@ -372,7 +367,6 @@ fun ThumbnailPreview(
         contentAlignment = Alignment.Center
     ) {
         if (lastPhotoUri != null) {
-            // 💡 Display the last photo using Coil
             AsyncImage(
                 model = lastPhotoUri,
                 contentDescription = "Last captured photo thumbnail",
@@ -380,7 +374,6 @@ fun ThumbnailPreview(
                 contentScale = ContentScale.Crop
             )
         } else {
-            // 💡 Display the default icon if no photo is available
             Icon(
                 imageVector = Icons.Default.PhotoLibrary,
                 contentDescription = "Last photo (none available)",
@@ -398,9 +391,7 @@ fun BottomSheetUI(
     onOptionSelected: (UiOption) -> Unit,
     onSwitchCamera: () -> Unit,
     onCapturePhoto: () -> Unit,
-    // 💡 NEW: Last photo URI getter
     getLastPhotoUri: () -> Uri?,
-    // 💡 NEW: Thumbnail click handler
     onThumbnailClick: () -> Unit
 ) {
     Column(
@@ -412,7 +403,6 @@ fun BottomSheetUI(
             )
             .padding(bottom = 16.dp)
     ) {
-        // Drag Handle
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -427,8 +417,6 @@ fun BottomSheetUI(
                     .background(Color(0xFF4A5568))
             )
         }
-
-        // Label
         Text(
             text = "Choose option",
             fontSize = 14.sp,
@@ -439,20 +427,16 @@ fun BottomSheetUI(
                 .padding(top = 8.dp, bottom = 4.dp),
             textAlign = TextAlign.Center
         )
-
-        // Option Selector
         OptionSelectorRow(
             selectedOption = selectedOption,
             onOptionSelected = onOptionSelected,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
         )
-
-        // Camera Controls
         CameraControlsRow(
             onSwitchCamera = onSwitchCamera,
             onCapturePhoto = onCapturePhoto,
-            getLastPhotoUri = getLastPhotoUri, // 💡 NEW
-            onThumbnailClick = onThumbnailClick, // 💡 NEW
+            getLastPhotoUri = getLastPhotoUri,
+            onThumbnailClick = onThumbnailClick,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
         )
     }
@@ -534,7 +518,6 @@ fun CameraControlsRow(
     onSwitchCamera: () -> Unit,
     onCapturePhoto: () -> Unit,
     modifier: Modifier = Modifier,
-    // 💡 NEW: Parameters
     getLastPhotoUri: () -> Uri?,
     onThumbnailClick: () -> Unit
 ) {
@@ -543,16 +526,11 @@ fun CameraControlsRow(
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // 💡 UPDATE: Thumbnail Preview button
         ThumbnailPreview(
             onClick = onThumbnailClick,
             lastPhotoUri = getLastPhotoUri()
         )
-
-        // Capture Button
         CaptureButton(onClick = onCapturePhoto)
-
-        // Switch Camera Button
         RoundIconButton(
             icon = Icons.Default.FlipCameraAndroid,
             onClick = onSwitchCamera,

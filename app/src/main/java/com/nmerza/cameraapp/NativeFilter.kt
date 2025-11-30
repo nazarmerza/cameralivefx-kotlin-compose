@@ -1,28 +1,32 @@
 package com.nmerza.cameraapp
 
+import java.nio.ByteBuffer
+
 class NativeFilter {
     companion object {
         init {
-            // Load the C++ library named 'camera_filter_lib'
+            // Must match your CMake target name
             System.loadLibrary("cameraapp-native")
         }
     }
 
-    // Function to process YUV data and return an RGBA byte array.
+    /**
+     * YUV_420_888 -> RGBA (for preview) with LUT, and packs NV12 (UV) into nv12Output for encoder.
+     */
     external fun processFrame(
-        yBuffer: java.nio.ByteBuffer,
-        uBuffer: java.nio.ByteBuffer,
-        vBuffer: java.nio.ByteBuffer,
+        yBuffer: ByteBuffer,
+        uBuffer: ByteBuffer,
+        vBuffer: ByteBuffer,
         width: Int,
         height: Int,
-        strideY: Int,
-        strideUV: Int,
-        pixelStrideUV: Int
+        yRowStride: Int,
+        uRowStride: Int,
+        vRowStride: Int,
+        uPixelStride: Int,
+        vPixelStride: Int,
+        nv12Output: ByteBuffer
     ): ByteArray
 
-    // Placeholder for LUT loading function.
     external fun loadLut(lutData: ByteArray, size: Int): Boolean
-
-    // New function to switch the active filter by name
     external fun setActiveFilter(filterName: String): Boolean
 }

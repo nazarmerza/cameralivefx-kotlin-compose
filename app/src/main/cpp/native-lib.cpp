@@ -2,17 +2,14 @@
 #include <android/log.h>
 #include <map>
 #include <string>
-#include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <memory>
 
 #define LOG_TAG "NativeFilter_CPP"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define CLAMP(x,a,b) std::fmax(a, std::fmin(b,(x)))
 
-// Using std::fmax and std::fmin for clamping
-#define CLAMP(x, min_val, max_val) std::fmax(min_val, std::fmin(max_val, x))
-
-// --- FILTER HEADERS ---
 #include "filters/BlueArchitecture.hpp"
 #include "filters/HardBoost.hpp"
 #include "filters/LongBeachMorning.hpp"
@@ -27,193 +24,160 @@
 #include "filters/CrispAutumn.hpp"
 #include "filters/DarkAndSomber.hpp"
 
-// --- GLOBAL CONSTANTS and TYPEDEFS ---
 static const int LUT_DIM = 33;
-// FIXED: Correctly defined as a pointer to a 4D array: [dim][dim][dim][3]
 using LutDataPointer = const float (*)[LUT_DIM][LUT_DIM][LUT_DIM][3];
-
-// --- GLOBAL STATE ---
 static LutDataPointer gCurrentLUT = nullptr;
 static std::map<std::string, LutDataPointer> gFilterMap;
 
+static void RGBAtoNV12(const uint8_t* rgba_in, uint8_t* nv12_out, int width, int height) {
+    uint8_t* yPlane = nv12_out;
+    uint8_t* uvPlane = nv12_out + width * height; // UV order
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = (y * width + x) * 4;
+            int R = rgba_in[idx + 0];
+            int G = rgba_in[idx + 1];
+            int B = rgba_in[idx + 2];
 
-// ----------------------------------------------------------------------
-// C++ Utility: Trilinear Interpolation
-// ----------------------------------------------------------------------
-static void apply_lut(float r_in, float g_in, float b_in, float r_out[3]) {
-    if (!gCurrentLUT) {
-        r_out[0] = r_in; r_out[1] = g_in; r_out[2] = b_in;
-        return;
-    }
+            int Y = (( 66*R + 129*G +  25*B + 128) >> 8) + 16;
+            int U = ((-38*R -  74*G + 112*B + 128) >> 8) + 128;
+            int V = ((112*R -  94*G -  18*B + 128) >> 8) + 128;
 
-    float r_coord = r_in * (LUT_DIM - 1);
-    float g_coord = g_in * (LUT_DIM - 1);
-    float b_coord = b_in * (LUT_DIM - 1);
+            Y = std::clamp(Y, 0, 255);
+            U = std::clamp(U, 0, 255);
+            V = std::clamp(V, 0, 255);
 
-    int x = (int)r_coord; int y = (int)g_coord; int z = (int)b_coord;
-    float x_d = r_coord - x; float y_d = g_coord - y; float z_d = b_coord - z;
+            yPlane[y * width + x] = static_cast<uint8_t>(Y);
 
-    int x1 = std::min(x + 1, LUT_DIM - 1);
-    int y1 = std::min(y + 1, LUT_DIM - 1);
-    int z1 = std::min(z + 1, LUT_DIM - 1);
-
-    for (int i = 0; i < 3; ++i) {
-        // FIXED: The `(*gCurrentLUT)` syntax is now correct because LutDataPointer is a pointer to the entire array.
-        float c00 = (*gCurrentLUT)[z][y][x][i] * (1.0f - x_d) + (*gCurrentLUT)[z][y][x1][i] * x_d;
-        float c10 = (*gCurrentLUT)[z][y1][x][i] * (1.0f - x_d) + (*gCurrentLUT)[z][y1][x1][i] * x_d;
-        float c01 = (*gCurrentLUT)[z1][y][x][i] * (1.0f - x_d) + (*gCurrentLUT)[z1][y][x1][i] * x_d;
-        float c11 = (*gCurrentLUT)[z1][y1][x][i] * (1.0f - x_d) + (*gCurrentLUT)[z1][y1][x1][i] * x_d;
-
-        float c0 = c00 * (1.0f - y_d) + c10 * y_d;
-        float c1 = c01 * (1.0f - y_d) + c11 * y_d;
-
-        float c = c0 * (1.0f - z_d) + c1 * z_d;
-
-        r_out[i] = CLAMP(c, 0.0f, 1.0f);
+            if ((y & 1) == 0 && (x & 1) == 0) {
+                int uv_index = (y / 2) * width + (x & ~1);
+                uvPlane[uv_index + 0] = static_cast<uint8_t>(U); // U first
+                uvPlane[uv_index + 1] = static_cast<uint8_t>(V); // V second
+            }
+        }
     }
 }
 
+static void apply_lut(float r, float g, float b, float out_rgb[3]) {
+    if (!gCurrentLUT) { out_rgb[0]=r; out_rgb[1]=g; out_rgb[2]=b; return; }
 
-// ----------------------------------------------------------------------
-// JNI: Frame Processing
-// ----------------------------------------------------------------------
+    float rx = r * (LUT_DIM-1), gx = g * (LUT_DIM-1), bx = b * (LUT_DIM-1);
+    int x = (int)rx, y = (int)gx, z = (int)bx;
+    float dx = rx-x, dy=gx-y, dz=bx-z;
+    int x1 = std::min(x+1, LUT_DIM-1);
+    int y1 = std::min(y+1, LUT_DIM-1);
+    int z1 = std::min(z+1, LUT_DIM-1);
+
+    for (int c=0;c<3;++c){
+        float c00 = (*gCurrentLUT)[z][y][x][c]*(1-dx) + (*gCurrentLUT)[z][y][x1][c]*dx;
+        float c10 = (*gCurrentLUT)[z][y1][x][c]*(1-dx)+ (*gCurrentLUT)[z][y1][x1][c]*dx;
+        float c01 = (*gCurrentLUT)[z1][y][x][c]*(1-dx)+ (*gCurrentLUT)[z1][y][x1][c]*dx;
+        float c11 = (*gCurrentLUT)[z1][y1][x][c]*(1-dx)+(*gCurrentLUT)[z1][y1][x1][c]*dx;
+        float c0 = c00*(1-dy) + c10*dy;
+        float c1 = c01*(1-dy) + c11*dy;
+        out_rgb[c] = CLAMP(c0*(1-dz) + c1*dz, 0.f, 1.f);
+    }
+}
 
 extern "C" JNIEXPORT jbyteArray JNICALL
 Java_com_nmerza_cameraapp_NativeFilter_processFrame(
-        JNIEnv* env,
-        jobject /* this */,
-        jobject yBuffer,
-        jobject uBuffer,
-        jobject vBuffer,
-        jint width,
-        jint height,
-        jint strideY,
-        jint strideUV,
-        jint pixelStrideUV) // IMPORTANT: This new parameter is needed for robust processing.
+        JNIEnv* env, jobject /*this*/,
+        jobject yBuffer, jobject uBuffer, jobject vBuffer,
+        jint width, jint height,
+        jint yRowStride,
+        jint uRowStride, jint vRowStride,
+        jint uPixelStride, jint vPixelStride,
+        jobject nv12OutputBuffer)
 {
-    uint8_t* y_ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuffer));
-    uint8_t* u_ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuffer));
-    uint8_t* v_ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuffer));
+    auto* Yp  = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuffer));
+    auto* Up  = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuffer));
+    auto* Vp  = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuffer));
+    auto* NV12= static_cast<uint8_t*>(env->GetDirectBufferAddress(nv12OutputBuffer));
+    if (!Yp || !Up || !Vp || !NV12) return nullptr;
 
-    if (!y_ptr || !u_ptr || !v_ptr) return nullptr;
+    const int num_px = width * height;
+    const int rgba_sz = num_px * 4;
+    std::unique_ptr<uint8_t[]> rgba(new (std::nothrow) uint8_t[rgba_sz]);
+    if (!rgba) return nullptr;
 
-    const int num_pixels = width * height;
-    const int output_size = num_pixels * 4;
-    uint8_t* rgba_out = new uint8_t[output_size];
+    float L[3];
+    for (int j=0;j<height;++j){
+        const int yBase = j * yRowStride;
+        const int uBase = (j/2) * uRowStride;
+        const int vBase = (j/2) * vRowStride;
 
-    float r_norm, g_norm, b_norm;
-    float filtered_rgb[3];
+        for (int i=0;i<width;++i){
+            const int yIdx = yBase + i;
+            const int uIdx = uBase + (i/2) * uPixelStride;
+            const int vIdx = vBase + (i/2) * vPixelStride;
 
-    for (int j = 0; j < height; ++j) {
-        for (int i = 0; i < width; ++i) {
-            int y_index = j * strideY + i;
-            int uv_x = i / 2;
-            int uv_y = j / 2;
+            const float Y = (float)(Yp[yIdx] & 0xFF);
+            const float U = (float)(Up[uIdx] & 0xFF);
+            const float V = (float)(Vp[vIdx] & 0xFF);
 
-            // FIXED: This logic now handles both Planar (I420) and Semi-Planar (NV21/NV12) YUV formats.
-            int uv_index = uv_y * strideUV + uv_x * pixelStrideUV;
+            const float C = Y - 16.f;
+            const float D = U - 128.f;
+            const float E = V - 128.f;
 
-            float Y = (float)(y_ptr[y_index] & 0xFF);
-            float U = (float)(u_ptr[uv_index] & 0xFF);
-            float V = (float)(v_ptr[uv_index] & 0xFF);
+            float r = (298.f*C + 409.f*E + 128.f) / 256.f;
+            float g = (298.f*C - 100.f*D - 208.f*E + 128.f) / 256.f;
+            float b = (298.f*C + 516.f*D + 128.f) / 256.f;
 
-            float C = Y - 16.0f;
-            float D = U - 128.0f;
-            float E = V - 128.0f;
+            r = CLAMP(r/255.f, 0.f, 1.f);
+            g = CLAMP(g/255.f, 0.f, 1.f);
+            b = CLAMP(b/255.f, 0.f, 1.f);
 
-            // FIXED: Added +128.0f for rounding before division to prevent image darkening.
-            float r_val = (298.0f * C + 409.0f * E + 128.0f) / 256.0f;
-            float g_val = (298.0f * C - 100.0f * D - 208.0f * E + 128.0f) / 256.0f;
-            float b_val = (298.0f * C + 516.0f * D + 128.0f) / 256.0f;
+            apply_lut(r,g,b,L);
 
-            // Normalize to 0.0-1.0 for the LUT
-            r_norm = CLAMP(r_val / 255.0f, 0.0f, 1.0f);
-            g_norm = CLAMP(g_val / 255.0f, 0.0f, 1.0f);
-            b_norm = CLAMP(b_val / 255.0f, 0.0f, 1.0f);
+            const uint8_t R = (uint8_t)std::round(CLAMP(L[0],0.f,1.f)*255.f);
+            const uint8_t G = (uint8_t)std::round(CLAMP(L[1],0.f,1.f)*255.f);
+            const uint8_t B = (uint8_t)std::round(CLAMP(L[2],0.f,1.f)*255.f);
 
-            apply_lut(r_norm, g_norm, b_norm, filtered_rgb);
-
-            uint8_t R = static_cast<uint8_t>(std::round(filtered_rgb[0] * 255.0f));
-            uint8_t G = static_cast<uint8_t>(std::round(filtered_rgb[1] * 255.0f));
-            uint8_t B = static_cast<uint8_t>(std::round(filtered_rgb[2] * 255.0f));
-
-            int output_index = (j * width + i) * 4;
-            rgba_out[output_index + 0] = R;
-            rgba_out[output_index + 1] = G;
-            rgba_out[output_index + 2] = B;
-            rgba_out[output_index + 3] = 255;
+            const int o = (j*width + i)*4;
+            rgba[o+0]=R; rgba[o+1]=G; rgba[o+2]=B; rgba[o+3]=255;
         }
     }
 
-    jbyteArray output_array = env->NewByteArray(output_size);
-    if (output_array == nullptr) {
-        delete[] rgba_out;
-        return nullptr;
-    }
+    RGBAtoNV12(rgba.get(), NV12, width, height);
 
-    env->SetByteArrayRegion(output_array, 0, output_size, reinterpret_cast<jbyte*>(rgba_out));
-    delete[] rgba_out;
-
-    return output_array;
+    jbyteArray out = env->NewByteArray(rgba_sz);
+    if (out) env->SetByteArrayRegion(out, 0, rgba_sz, reinterpret_cast<jbyte*>(rgba.get()));
+    return out;
 }
 
-
-// ----------------------------------------------------------------------
-// JNI: Filter Management
-// ----------------------------------------------------------------------
-
-void initialize_lut_map() {
-    gFilterMap["None"] = nullptr;
+// ---- Filters map / JNI plumbing ----
+static void initialize_lut_map() {
+    gFilterMap["None"]              = nullptr;
     gFilterMap["Blue Architecture"] = &BlueArchitecture;
-    gFilterMap["HardBoost"] = &HardBoost;
-    gFilterMap["LongBeachMorning"] = &LongBeachMorning;
-    gFilterMap["LushGreen"] = &LushGreen;
-    gFilterMap["MagicHour"] = &MagicHour;
-    gFilterMap["NaturalBoost"] = &NaturalBoost;
-    gFilterMap["OrangeAndBlue"] = &OrangeAndBlue;
+    gFilterMap["HardBoost"]         = &HardBoost;
+    gFilterMap["LongBeachMorning"]  = &LongBeachMorning;
+    gFilterMap["LushGreen"]         = &LushGreen;
+    gFilterMap["MagicHour"]         = &MagicHour;
+    gFilterMap["NaturalBoost"]      = &NaturalBoost;
+    gFilterMap["OrangeAndBlue"]     = &OrangeAndBlue;
     gFilterMap["SoftBlackAndWhite"] = &SoftBlackAndWhite;
-    gFilterMap["Waves"] = &Waves;
-    gFilterMap["BlueHour"] = &BlueHour;
-    gFilterMap["ColdChrome"] = &ColdChrome;
-    gFilterMap["CrispAutumn"] = &CrispAutumn;
-    gFilterMap["DarkAndSomber"] = &DarkAndSomber;
-
-    LOGD("Initialized %zu filters in the LUT map.", gFilterMap.size());
+    gFilterMap["Waves"]             = &Waves;
+    gFilterMap["BlueHour"]          = &BlueHour;
+    gFilterMap["ColdChrome"]        = &ColdChrome;
+    gFilterMap["CrispAutumn"]       = &CrispAutumn;
+    gFilterMap["DarkAndSomber"]     = &DarkAndSomber;
+    LOGD("Initialized %zu filters.", gFilterMap.size());
 }
 
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
-    initialize_lut_map();
-    return JNI_VERSION_1_6;
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) { initialize_lut_map(); return JNI_VERSION_1_6; }
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_nmerza_cameraapp_NativeFilter_setActiveFilter(JNIEnv* env, jobject, jstring name_) {
+    const char* cs = env->GetStringUTFChars(name_, 0);
+    std::string name(cs ? cs : "");
+    if (cs) env->ReleaseStringUTFChars(name_, cs);
+    auto it = gFilterMap.find(name);
+    if (it != gFilterMap.end()) { gCurrentLUT = it->second; LOGD("Filter: %s", name.c_str()); return JNI_TRUE; }
+    LOGD("Filter not found: %s", name.c_str()); return JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_nmerza_cameraapp_NativeFilter_setActiveFilter(
-        JNIEnv* env,
-        jobject /* this */,
-        jstring filterName_) {
-
-    const char *filterNameCStr = env->GetStringUTFChars(filterName_, 0);
-    std::string filterName(filterNameCStr);
-    env->ReleaseStringUTFChars(filterName_, filterNameCStr);
-
-    auto it = gFilterMap.find(filterName);
-
-    if (it != gFilterMap.end()) {
-        gCurrentLUT = it->second;
-        LOGD("Switched filter to: %s", filterName.c_str());
-        return JNI_TRUE;
-    } else {
-        LOGD("Error: Filter not found: %s", filterName.c_str());
-        return JNI_FALSE;
-    }
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_nmerza_cameraapp_NativeFilter_loadLut(
-        JNIEnv* env,
-        jobject /* this */,
-        jbyteArray lutData,
-        jint size) {
-    LOGD("loadLut is unused. Using static .hpp files.");
+Java_com_nmerza_cameraapp_NativeFilter_loadLut(JNIEnv*, jobject, jbyteArray, jint) {
+    LOGD("loadLut unused; static .hpp LUTs in use.");
     return JNI_TRUE;
 }
